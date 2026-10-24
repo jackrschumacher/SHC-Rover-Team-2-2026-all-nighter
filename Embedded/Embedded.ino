@@ -48,6 +48,21 @@ File dataFile;
 #define FLUSH_INTERVAL_MS 1000
 unsigned long lastLogTime = 0;
 unsigned long lastFlushTime = 0;
+#define SERIAL_PRINT_INTERVAL_MS 1000
+unsigned long lastSerialPrintTime = 0;
+#define CSV_HEADER "Time_ms,Heading_deg,Pitch_deg,Roll_deg,Temp_C,Pressure_hPa,Altitude_m"
+
+// Writes one CSV row to any output (SD file or Serial)
+void printCsvRow(Print &out, unsigned long timeMs, sensors_event_t &orientation,
+                 float temp, float pressure, float altitude) {
+  out.print(timeMs); out.print(",");
+  out.print(orientation.orientation.x); out.print(",");
+  out.print(orientation.orientation.y); out.print(",");
+  out.print(orientation.orientation.z); out.print(",");
+  out.print(temp); out.print(",");
+  out.print(pressure); out.print(",");
+  out.println(altitude);
+}
 
 void setup() {
   // put your setup code here, to run once:
@@ -104,27 +119,100 @@ void setup() {
     dataFile = SD.open("data.csv", FILE_WRITE);
     
     if (dataFile && !fileExists) {
-      dataFile.println("Time_ms,Heading_deg,Pitch_deg,Roll_deg,Temp_C,Pressure_hPa,Altitude_m");
+      dataFile.println(CSV_HEADER);
       dataFile.flush();
     }
   }
 
+  Serial.println(CSV_HEADER);
 
+}
+
+// Command parsing:
+// Expects "motor,axis1,axis2,axis3,claw\n", each value 0-99
+#define NUM_VALUES 5
+#define CMD_BUF_LEN 32
+#define SERVO_MAX_DEG 180
+#define CLAW_MAX_DEG 60
+#define MOTOR_DEADBAND 10 // PWM below this is treated as stop
+
+char cmdBuf[CMD_BUF_LEN];
+int cmdLen = 0;
+bool cmdOverflow = false;
+
+// 0 = full reverse, ~49/50 = stop, 99 = full forward
+void driveMotor(int value) {
+  int speed = map(value, 0, 99, -255, 255);
+  if (abs(speed) < MOTOR_DEADBAND) {
+    digitalWrite(MOTOR_AIN1, LOW);
+    digitalWrite(MOTOR_AIN2, LOW);
+    analogWrite(MOTOR_PWMA, 0);
+  } else if (speed > 0) {
+    digitalWrite(MOTOR_AIN1, HIGH);
+    digitalWrite(MOTOR_AIN2, LOW);
+    analogWrite(MOTOR_PWMA, speed);
+  } else {
+    digitalWrite(MOTOR_AIN1, LOW);
+    digitalWrite(MOTOR_AIN2, HIGH);
+    analogWrite(MOTOR_PWMA, -speed);
+  }
+}
+
+// Returns false (and moves nothing) if the line is malformed
+bool parseCommand(char *line) {
+  int values[NUM_VALUES];
+  int count = 0;
+
+  char *token = strtok(line, ",");
+  while (token != NULL) {
+    if (count >= NUM_VALUES) return false;
+
+    char *end;
+    long v = strtol(token, &end, 10);
+    while (*end == ' ' || *end == '\r') end++;
+    if (end == token || *end != '\0' || v < 0 || v > 99) return false;
+
+    values[count++] = (int)v;
+    token = strtok(NULL, ",");
+  }
+  if (count != NUM_VALUES) return false;
+
+  driveMotor(values[0]);
+  axis1.write(map(values[1], 0, 99, 0, SERVO_MAX_DEG));
+  axis2.write(map(values[2], 0, 99, 0, SERVO_MAX_DEG));
+  axis3.write(map(values[3], 0, 99, 0, SERVO_MAX_DEG));
+  claw.write(map(values[4], 0, 99, 0, CLAW_MAX_DEG));
+  return true;
+}
+
+// Non-blocking so sensor logging keeps running between commands
+void readSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      cmdBuf[cmdLen] = '\0';
+      if (cmdOverflow || (cmdLen > 0 && !parseCommand(cmdBuf))) {
+        Serial.println("Bad command, expected 5 values 0-99: m,a1,a2,a3,claw");
+      }
+      cmdLen = 0;
+      cmdOverflow = false;
+    } else if (cmdLen < CMD_BUF_LEN - 1) {
+      cmdBuf[cmdLen++] = c;
+    } else {
+      cmdOverflow = true; // Drop the rest of this line
+    }
+  }
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
 
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    
-
-  }
+  readSerialCommands();
 
    unsigned long currentMillis = millis();
   if (currentMillis - lastLogTime >= LOG_INTERVAL_MS) {
     lastLogTime = currentMillis;
-
+    
     sensors_event_t orientationData;
     bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
 
@@ -135,13 +223,12 @@ void loop() {
 
     // Fast append without re-opening the file system cluster maps
     if (dataFile) {
-      dataFile.print(currentMillis); dataFile.print(",");
-      dataFile.print(orientationData.orientation.x); dataFile.print(",");
-      dataFile.print(orientationData.orientation.y); dataFile.print(",");
-      dataFile.print(orientationData.orientation.z); dataFile.print(",");
-      dataFile.print(temp); dataFile.print(",");
-      dataFile.print(pressure); dataFile.print(",");
-      dataFile.println(altitude);
+      printCsvRow(dataFile, currentMillis, orientationData, temp, pressure, altitude);
+    }
+
+    if (currentMillis - lastSerialPrintTime >= SERIAL_PRINT_INTERVAL_MS) {
+      lastSerialPrintTime = currentMillis;
+      printCsvRow(Serial, currentMillis, orientationData, temp, pressure, altitude);
     }
   }
   if (currentMillis - lastFlushTime >= FLUSH_INTERVAL_MS) {
